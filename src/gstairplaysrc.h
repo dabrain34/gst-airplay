@@ -71,11 +71,14 @@ struct _GstAirplaySrc
 
   GstPad *srcpad;
 
-  GstTask *task;
+  GstTask *main_task;
+  GstTask *audio_task;
 #if HAVE_GST_1
-  GRecMutex task_lock;
+  GRecMutex main_task_lock;
+  GRecMutex audio_task_lock;
 #else
-  GStaticRecMutex task_lock;
+  GStaticRecMutex main_task_lock;
+  GStaticRecMutex audio_task_lock;
 #endif
   gboolean silent;
 };

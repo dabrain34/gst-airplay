@@ -64,8 +64,29 @@
 
 #include "gstairplaysrc.h"
 
+#include <shairport/shairport.h>
+
+#include <unistd.h>
+#include <string.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+
+
+
 GST_DEBUG_CATEGORY_STATIC (gst_airplay_src_debug);
 #define GST_CAT_DEFAULT gst_airplay_src_debug
+
+/*Audio output for airplay */
+
+static const gchar* pipename = "/tmp/airplay_audio";
+static int pipe_handle = -1;
+#define AUDIO_BUF_SIZE 10
+
+/* shairport init string*/
+
+#define SHAIRPORT_INIT_STR "--apname=%s"
+#define SHAIRPORT_APNAME "gstairplay"
 
 /* Filter signals and args */
 enum
@@ -102,13 +123,83 @@ static void gst_airplay_get_property (GObject * object, guint prop_id,
 /* GObject vmethod implementations */
 
 static void
-gst_airplay_src_loop (gpointer user_data)
+gst_airplay_src_main_loop (gpointer user_data)
 {
   GstAirplaySrc *thiz;
 
   thiz = GST_AIRPLAY_SRC (user_data);
 
-  gst_task_stop (thiz->task);
+  shairport_loop();
+
+  gst_task_stop (thiz->main_task);
+}
+
+static gboolean
+gst_airplay_src_send_audio_data(GstAirplaySrc *thiz, signed short *buffer, gint size)
+{
+	gboolean ret = TRUE;
+	GstFlowReturn flow;
+    GstBuffer *buf;
+    guint8 *data;
+
+    buf = gst_buffer_new_and_alloc (size);
+#if HAVE_GST_1
+    gst_buffer_map (buf, &mi, GST_MAP_WRITE);
+    data = mi.data;
+#else
+    data = GST_BUFFER_DATA (buf);
+#endif
+
+    memcpy (data, buffer, size);
+
+#if HAVE_GST_1
+    gst_buffer_unmap (buf, &mi);
+#endif
+
+
+    GST_DEBUG_OBJECT (thiz, "Pushing audio data");
+    flow = gst_pad_push (thiz->srcpad, buf);
+    if (flow != GST_FLOW_OK) {
+      if (flow == GST_FLOW_NOT_LINKED || flow <= GST_FLOW_UNEXPECTED) {
+        GST_ELEMENT_ERROR (thiz, STREAM, FAILED,
+            ("Internal data flow error."),
+            ("streaming task paused, reason %s (%d)",
+            gst_flow_get_name (flow), flow));
+      }
+      ret = FALSE;
+    }
+
+	return ret;
+}
+
+static void
+gst_airplay_src_audio_loop (gpointer user_data)
+{
+  GstAirplaySrc *thiz;
+  signed short buf[AUDIO_BUF_SIZE];
+  int numRead;
+  thiz = GST_AIRPLAY_SRC (user_data);
+
+  while (shairport_is_running()) {
+	  if (pipe_handle != -1) {
+		  numRead = read(pipe_handle, buf, AUDIO_BUF_SIZE);
+		  if (numRead == -1)
+			  g_print("numread is -1");
+		  else {
+			  gst_airplay_src_send_audio_data(thiz, buf, AUDIO_BUF_SIZE);
+		  }
+	  } else {
+		  pipe_handle = open(pipename, O_RDONLY);
+		  if(pipe_handle == -1) {
+			  GST_DEBUG_OBJECT(thiz,"Pipe not ready\n");
+			  usleep(1000);
+		  }
+	  }
+  }
+
+  gst_task_stop (thiz->audio_task);
+  if( pipe_handle != -1)
+	  close(pipe_handle);
 }
 
 static void
@@ -118,32 +209,61 @@ gst_airplay_src_task_cleanup (GstAirplaySrc * thiz)
   /* given that the pads are removed on the parent class at the paused
    * to ready state, we need to exit the task and wait for it
    */
-  if (thiz->task) {
-    gst_task_stop (thiz->task);
-    gst_task_join (thiz->task);
-    gst_object_unref (thiz->task);
-    thiz->task = NULL;
+  shairport_exit();
+
+  if (thiz->main_task) {
+    gst_task_stop (thiz->main_task);
+    gst_task_join (thiz->main_task);
+    gst_object_unref (thiz->main_task);
+    thiz->main_task = NULL;
+  }
+  if (thiz->audio_task) {
+    gst_task_stop (thiz->audio_task);
+    gst_task_join (thiz->audio_task);
+    gst_object_unref (thiz->audio_task);
+    thiz->audio_task = NULL;
   }
 }
 
 static void
-gst_airplay_src_task_setup (GstAirplaySrc * thiz)
+gst_airplay_src_main_task_setup (GstAirplaySrc * thiz)
 {
-  /* to pop from the libtorrent async system */
+
+  gchar* shairport_init_str = g_strdup_printf(SHAIRPORT_INIT_STR, SHAIRPORT_APNAME);
+  gchar** shairport_argv = g_strsplit(shairport_init_str,"|",-1);
+  g_free(shairport_init_str);
+
+  shairport_main(1,shairport_argv);
+
 #if HAVE_GST_1
-  thiz->task = gst_task_new (gst_airplay_src_loop, thiz, NULL);
+  thiz->main_task = gst_task_new (gst_airplay_src_main_loop, thiz, NULL);
 #else
-  thiz->task = gst_task_create (gst_airplay_src_loop, thiz);
+  thiz->main_task = gst_task_create (gst_airplay_src_main_loop, thiz);
 #endif
-  gst_task_set_lock (thiz->task, &thiz->task_lock);
-  gst_task_start (thiz->task);
+  gst_task_set_lock (thiz->main_task, &thiz->main_task_lock);
+  gst_task_start (thiz->main_task);
+}
+
+static void
+gst_airplay_src_audio_task_setup (GstAirplaySrc * thiz)
+{
+  if( pipe_handle != -1)
+	  pipe_handle = open(pipename, O_RDONLY);
+
+#if HAVE_GST_1
+  thiz->audio_task = gst_task_new (gst_airplay_src_audio_loop, thiz, NULL);
+#else
+  thiz->audio_task = gst_task_create (gst_airplay_src_audio_loop, thiz);
+#endif
+  gst_task_set_lock (thiz->audio_task, &thiz->audio_task_lock);
+  gst_task_start (thiz->audio_task);
 }
 
 static gboolean
 gst_airplay_src_setup (GstAirplaySrc * thiz)
 {
-
-  gst_airplay_src_task_setup (thiz);
+  gst_airplay_src_main_task_setup (thiz);
+  gst_airplay_src_audio_task_setup (thiz);
 
   return TRUE;
 }
