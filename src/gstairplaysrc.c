@@ -141,6 +141,9 @@ gst_airplay_src_send_audio_data(GstAirplaySrc *thiz, signed short *buffer, gint 
 	GstFlowReturn flow;
     GstBuffer *buf;
     guint8 *data;
+#if HAVE_GST_1
+        GstMapInfo mi;
+#endif
 
     buf = gst_buffer_new_and_alloc (size);
 #if HAVE_GST_1
@@ -160,7 +163,7 @@ gst_airplay_src_send_audio_data(GstAirplaySrc *thiz, signed short *buffer, gint 
     GST_DEBUG_OBJECT (thiz, "Pushing audio data");
     flow = gst_pad_push (thiz->srcpad, buf);
     if (flow != GST_FLOW_OK) {
-      if (flow == GST_FLOW_NOT_LINKED || flow <= GST_FLOW_UNEXPECTED) {
+      if (flow == GST_FLOW_NOT_LINKED) {
         GST_ELEMENT_ERROR (thiz, STREAM, FAILED,
             ("Internal data flow error."),
             ("streaming task paused, reason %s (%d)",
@@ -415,10 +418,16 @@ airplay_src_init (GstPlugin * airplaysrc)
  *
  * exchange the string 'Template airplay' with your airplay description
  */
+ #if HAVE_GST_1
+#define PLUGIN_NAME airplay
+#else
+#define PLUGIN_NAME "airplay"
+#endif
+
 GST_PLUGIN_DEFINE (
     GST_VERSION_MAJOR,
     GST_VERSION_MINOR,
-    "airplay",
+    PLUGIN_NAME,
     "airplay source element",
 	airplay_src_init,
     VERSION,
